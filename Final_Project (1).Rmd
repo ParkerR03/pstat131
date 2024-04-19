@@ -1,0 +1,428 @@
+---
+title: "Final Project PSTAT131"
+subtitle: "Spotify songs as of 2023"
+author: "Parker Reedy and Chris Zhao"
+output: pdf_document
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+---
+
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+library(knitr)
+# set global chunk options: images will be 7x5 inches
+knitr::opts_chunk$set(fig.width=7, fig.height=5)
+options(digits = 4)
+
+## indents are for indenting r code as formatted text
+## They may need to be adjusted depending on your OS
+# if your output looks odd, increase or decrease indent
+indent1 = '    '
+indent2 = '        '
+indent3 = '            '
+
+#libraries
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(randomForest)
+library(tree)
+library(gbm)
+library(class)
+library(FNN)
+library(corrplot)
+```
+
+# Data description
+
+This dataset contains a list of the most famous songs as listed on Spotify in 2023 found on the website Kaggle.com. The dataset offers a wealth of features beyond what is typically available in similar datasets. It provides insights into each song's attributes, popularity, and presence on various music platforms. The dataset includes information such as track name, artist(s) name, release date, Spotify playlists and charts, streaming statistics, Apple Music presence, Deezer presence, Shazam charts, and various audio features. Look at the following infomation for details on the 24 total variables in the data set.
+
+
+* track_name: Name of the song \
+* artist_name: Name of the artist(s) of the song \
+* artist_count: Number of artists contributing to the song \
+* released_year: Year when the song was released \
+* released_month: Month when the song was released \
+* released_day: Day of the month when the song was released \
+* in_spotify_playlists: Number of Spotify playlists the song is included in \
+* in_spotify_charts: Presence and rank of the song on Spotify charts \
+* streams: Total number of streams on Spotify \
+* in_apple_playlists: Number of Apple Music playlists the song is included in \
+* in_apple_charts: Presence and rank of the song on Apple Music charts \
+* in_deezer_playlists: Number of Deezer playlists the song is included in \
+* in_deezer_charts: Presence and rank of the song on Deezer charts \
+* in_shazam_charts: Presence and rank of the song on Shazam charts \
+* bpm: Beats per minute, a measure of song tempo \
+* key: Key of the song \
+* mode: Mode of the song (major or minor) \
+* danceability_%: Percentage indicating how suitable the song is for dancing \
+* valence_%: Positivity of the song's musical content \
+* energy_%: Perceived energy level of the song \
+* acousticness_%: Amount of acoustic sound in the song \
+* instrumentalness_%: Amount of instrumental content in the song \
+* liveness_%: Presence of live performance elements \
+* speechiness_%: Amount of spoken words in the song \
+
+---
+
+# Question of Interest
+One of the most important parts of making music is for it to be heard by everyone. In this analysis, we attempt to answer the question of what variables have the most impact in predicting the number of streams (or listens) a Spotify song has. Because we are working with a numeric response variable, we will be using regression to understand these relationships.
+
+---
+
+# Data Cleaning
+
+First, read in our data from csv file.
+
+```{r, message=FALSE}
+dataset <- read_csv('spotify-2023.csv', show_col_types = FALSE)
+head(dataset)
+```
+
+```{r}
+spotify <- data.frame(dataset)
+
+missing_columns <- spotify %>% is.na() %>% colSums()
+names(missing_columns[missing_columns != 0])
+```
+
+As we can see, there are only missing values in the variables `in_shazam_chart` and `key`. For the Shazam charts, the missing values represent the song not being on the chart so we will replace them with zeros. There are also commas in this variable so we want to remove them.
+
+```{r}
+spotify$in_shazam_charts[is.na(spotify$in_shazam_charts)] <- 0
+
+spotify$in_shazam_charts <- gsub(',', '', spotify$in_shazam_charts)
+spotify$in_shazam_charts <- as.numeric(spotify$in_shazam_charts)
+
+missing_columns2 <- spotify %>% is.na() %>% colSums()
+names(missing_columns2[missing_columns2 != 0])
+```
+
+For the missing `key` values, since `key` might be an important part of song analysis, we will remove the observations with missing values and because it is the only variable with missing values, we can just use `na.omit()`.
+
+```{r}
+spotify <- na.omit(spotify)
+```
+
+Let's Check the type of variables before analysis.
+```{r}
+str(spotify)
+```
+We can see that `streams` is a character variable so we need to change that to numeric.
+
+```{r}
+spotify$streams <- as.numeric(spotify$streams)
+```
+It seems that we get an error saying that NAs were introduced when setting streams to numeric.
+
+```{r}
+dataset[575, 9]
+```
+By checking our row data, it seems like an input error, so we will just remove the observation.
+
+```{r}
+spotify <- na.omit(spotify)
+
+#sum of the number of missing values from each column
+sum(spotify %>% is.na() %>% colSums())
+```
+
+Now we have no missing values and all the categories of our data are correct. 857 total observations left. For the sake of simplicity, we are going to log the streams values to make analysis easier.
+
+```{r}
+spotify$streams <- log(spotify$streams) # apply log
+```
+
+```{r}
+spotify_num <- spotify[-1]
+
+spotify_num$mode <- as.numeric(as.factor(spotify_num$mode))
+spotify_num$key <- as.numeric(as.factor(spotify_num$key))
+spotify_num$artist.s._name <- as.numeric(as.factor(spotify_num$artist.s._name))
+```
+
+Encode `mode`, `key` and etc to factor so that we can use it as predictor.
+
+Now that the data is tidy, it is ready to be analyzed.
+
+---
+
+# Data Analysis
+
+First, we are going to start with a correlation matrix to plot the correlations between each variable so we can better understand our data.
+```{r fig.height=7}
+#create the correlation matrix and heatmap
+cor_matrix <- cor(spotify_num)
+corrplot(cor_matrix, method = "color", type = 'lower', 
+         number.cex = 0.45, addCoef.col = 'black')
+```
+
+The correlation plot use color and value to show the strength of the correlation between all variables except the name of songs. Values closer to 1 appear as a darker blue while values closer to -1 appear as a darker orange. Now, we want to focus on our most interested variable, streams.
+
+```{r}
+streams_cor <- cor_matrix["streams",]
+streams_cor
+```
+
+Filter out those that are too weakly related.
+
+```{r}
+streams_cor[abs(streams_cor) > 0.2 & streams_cor != 1]
+```
+
+Here are all variable whose absolute values of correlation coefficient with `streams` are greater than 0.2. For these values great than 0.2, the strength of their association are not regarded as very weak. So, let's prioritize the few parameters shown above.
+
+
+# Principal Components Analysis
+
+```{r}
+pc.out <- prcomp(spotify_num, scale=TRUE)
+```
+
+```{r}
+summary(pc.out)
+```
+
+We see that the first principal component explains 15.5% of the variance in the data, the next principal
+component explains 10.3% of the variance, and so forth. 
+
+We can plot the PVE explained by each component, as well as the cumulative PVE, as follow
+
+```{r}
+pc.summary <- summary(pc.out)$importance %>% 
+  t() %>% 
+  as.data.frame()
+```
+
+```{r}
+ggplot(pc.summary, aes(x = 1:nrow(pc.summary))) +
+  geom_line(aes(y = `Proportion of Variance`, color = 'PVE'), linewidth = 1) +
+  geom_line(aes(y = `Cumulative Proportion`, color = 'Cumulative PVE'), linewidth = 1) +
+  labs(x = 'Principal Component', y = 'Proportion', 
+       title = 'Proportion of Variance Explained by Principal Components') 
+```
+```{r}
+pc.biplot <- as.data.frame(pc.out$rotation[, 1:2])  # Extract the first two principal components
+pc.biplot$variable <- rownames(pc.biplot)  # Add variable names as a new column
+
+#create the plot
+ggplot(pc.biplot, aes(x = PC1, y = PC2, label = variable)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  geom_segment(aes(x = 0, y = 0, xend = PC1, yend = PC2), arrow = arrow(length = unit(0.2, "cm")), color = "blue") +
+  geom_text(nudge_x = 0.02, nudge_y = 0.02, check_overlap = TRUE, size = 3) +
+  labs(title = "PCA Biplot") +
+  theme_minimal()
+```
+From this plot of PCA1 vs PCA2 above, we can see that many of out variables of importance are have vectors pointing towards a similar direction and have a similar length which suggests that these variables are positively correlated with each other and contribute similarly to the Principal Components. If we look at the streams vector pointing to the bottom right, we notice that the vectors pointing in the opposite direction have a negative correlation with streams as seen in the correlation plot earlier. Now, lets make some models to help us predict the amount of streams a spotify song has.
+
+From the PCA plot and the correlation heatmap, Released_year is an interesting variable because it seems to have a negative correlation with Streams meaning that an increase in year indicates a decrease in the number of streams.
+```{r}
+ggplot(spotify, aes(x = released_year, y = streams)) + geom_point() + labs(
+  title = 'Released Year vs Number of Streams'
+)
+
+```
+From this plot, we can see that The number of streams of a song that came out very recently is not very high which intuitively makes sense. But not including the most recent years, the plot seems to be slightly positively correlated. The amount of streams increases as the year increases. The reason for the negative correlation is that the most recent songs have not had enough time to obtain the true number of streams. This is just something to keep in mind for future predictions. It is important to note that the number of streams for songs in current years will go up in future updated datasets but similar observations will be seen for newer songs.
+
+
+# Simple Linear Regression Model
+
+To start off, lets fit a simple Linear Regression model to a training set and use it to predict a test set.
+```{r}
+#set seed for reproducability
+set.seed(123)
+
+songs <- spotify %>% select(-track_name, -artist.s._name)
+
+#training with 500, test with the rest
+training = sample(1:nrow(songs), 500)
+songs.train = songs[training,]
+songs.test = songs[-training,]
+
+SpotYTrain = songs.train$streams
+SpotXTrain = songs.train %>% select(-streams)
+SpotYTest = songs.test$streams
+SpotXTest = songs.test %>% select(-streams)
+
+
+#creating the model will all predictors
+mod1 <- lm(streams~., data=songs.train)
+
+#predict on test set
+predictions <- predict(mod1, songs.test)
+
+#find Test MSE for this model
+mse <- mean((predictions - SpotYTest)^2)
+mse
+```
+Now we have a baseline MSE for a model with all predictors. For the last Linear model, lets only do the predictors that we found earlier to be useful.
+```{r}
+#set seed for reproducability
+set.seed(123)
+
+#create a linear model with less predictors
+mod2 <- lm(streams~ in_spotify_playlists + in_apple_playlists + in_deezer_playlists + in_apple_charts + in_deezer_charts + in_shazam_charts + in_spotify_charts, data=songs.train)
+
+#predict on test set
+predictions2 <- predict(mod2, songs.test)
+
+#find Test MSE for this model
+mse2 <- mean((predictions - SpotYTest)^2)
+mse2
+
+```
+We can see that the MSE of the 2 models are very similar so lets take a look at the anova table to measure the usefulness of the predictors in the models.
+```{r}
+anova(mod2, mod1)
+```
+
+After looking at the anova table between the two models, it is clear that there is no significant difference between the predicted values because the Pr(>F) is .49 meaning that we fail to reject the null hypothesis that there is a difference between the models. The model with less predictors is just as important and by the Occams Razor principle, the model with less predictors is better. We will use this model as a baseline for testing MSE.
+
+# K-Nearest Neighbors Model
+
+First, Lets make a subset with the variables that we are interested in and then find the best k value for K-Nearest neighbors.
+```{r}
+playlist = spotify %>% 
+  select(streams, in_spotify_playlists, in_apple_playlists, in_deezer_playlists)
+
+data <- playlist
+target <- data$streams
+
+k_folds <- 10
+
+# Perform K-fold cross-validation with different K values
+k_range <- 1:100
+best_k <- 0
+lowest_mse <- Inf
+
+for (k in k_range) {
+  # Train the KNN model for the current K value
+  knn_model <- knn.reg(train = data, y = target, k = k)
+
+  # Calculate the average MSE across folds
+  mse_per_fold <- sapply(1:k_folds, function(fold) {
+    # Extract training and testing data for the current fold
+    train_index <- (1:(k_folds * fold)) %% k_folds + 1 != fold
+    test_index <- (1:(k_folds * fold)) %% k_folds + 1 == fold
+
+    # Predict on the testing data
+    predictions <- knn_model$pred[-train_index]
+
+    # Calculate the MSE for the current fold
+    mean((predictions - target[-train_index])^2)
+  })
+
+  # Calculate the average MSE across all folds
+  average_mse <- mean(mse_per_fold)
+
+  # Check if the current K value has the lowest average MSE
+  if (average_mse < lowest_mse) {
+    lowest_mse <- average_mse
+    best_k <- k
+  }
+}
+
+cat("Best k:", best_k)
+
+```
+
+As we can see, the best K value seems to be 34. Lets use this to train a K-Nearest Neighbors model looking at just the playlists variables.
+```{r}
+#set seed for reproducability
+set.seed(123)
+
+#Splitting data into train and test
+train = sample(1:nrow(playlist), 500)
+playlist.train = playlist[train,]
+playlist.test = playlist[-train,]
+
+#splitting data into X and Y / Train and Test
+YTrain = playlist.train$streams
+XTrain = playlist.train %>% select(-streams) %>% scale(center = TRUE, scale = TRUE)
+YTest = playlist.test$streams
+XTest = playlist.test %>% select(-streams) %>% scale(center = TRUE, scale = TRUE)
+
+
+#Make model for training and test data using TRAINING data
+
+pred.YTtrain = knn.reg(train=XTrain, test=XTrain, y=YTrain, k=best_k)
+pred.YTest = knn.reg(train=XTrain, test=XTest, y=YTrain, k=best_k)
+
+#Print results
+print(paste(round(mean((pred.YTtrain$pred - YTrain)^2),4) , ': Training MSE'))
+print(paste(round(mean((pred.YTest$pred - YTest)^2), 4), ': Test MSE'))
+```
+The Test MSE for this model is 0.4426. This model works better than both of the linear regression models we made previously when looking at the MSE.
+
+Next, we want to fit a model that will allow us to test if more variables can help the Test MSE. The reason we want to do this is because K-nearest Neighbors works better with a small amount of predictors.
+
+
+
+
+# Bagging model and Random Forest model
+
+Now, lets try to fit a bagging model and a random forest model
+
+```{r}
+#Splitting data into test and train
+set.seed(123)
+
+#removing artist name and track name
+subset2 <- spotify[, -c(1,2)]
+#2nd training set 
+
+train = sample(nrow(subset2), 0.75*nrow(subset2))
+train.spotify = subset2[train,]
+test.spotify = subset2[-train,]
+```
+
+This is the bagged model because mtry = 21 which is the number of predictors in the model (m = p). This determines the number of predictors that should be considered for each split of the tree. 
+
+```{r}
+#fit a random forest model with m = p for a bagged model
+bag.spotify = randomForest(streams ~ ., data=train.spotify,
+                           mtry=21, importance=TRUE)
+plot(bag.spotify)
+```
+This plot shows how the Error changes with the number of trees it makes. Now lets use the model to predict the MSE of this model.
+
+```{r}
+yhat.bag = predict(bag.spotify, newdata = test.spotify)
+mean((yhat.bag - test.spotify$streams)^2)
+
+#show importance of variables
+importance(bag.spotify)
+```
+The MSE for this model is surprisingly low compared to the other models that we made so far. One last thing we should check is that if we use a slightly different method called Random Forest. This method is used to decorrelate the trees so that the prediction is less variable. Lets set mtry = 5 (chosen because usually m is chosen as the square root of the total number of predictors = sqrt(20)) which will test 5 random variables at each split in the tree.
+
+```{r}
+#fit a random forest model
+rf.spotify = randomForest(streams ~., data=train.spotify, mtry = 5, importance=TRUE)
+plot(rf.spotify)
+```
+This is the Error for the Random Forest as it produces more trees. Finally, lets test the MSE for this model to see if its lower than previous ones.
+
+```{r}
+#predict with the forest model
+yhat.forest = predict(rf.spotify, newdata = test.spotify)
+mean((yhat.forest - test.spotify$streams)^2)
+
+#show importance of variables
+importance(rf.spotify)
+```
+The MSE of .297 is actually very similar to the previous Bagging method. From all of our models, it seems that the Bagging and Random Forest model produces the best results. Also after using the `importance()` function, many of the variables we deemed important earlier are shown to have a large affect on the MSE. We can also see that released_year is an important variable in both of these models and from the plot we made earlier, we know that released_year does have an affect on the number of streams a song has.
+
+
+
+
+
+
+
+
+
+## Findings
+
+From our analysis on the Spotify Dataset, we found that the most important variables in predicting the number of streams a song has is the in_playlists variables as well as the release year of the song. Intuitively this makes sense when thinking about the type of data we have. The more recent the song is, the less total streams it will have and the more playlists that the song is in, the more streams it will receive. After testing many models, we came to the conclusion that the best one was the tree based models which had the lowest MSE of all the models tested. One of the most important figures shown is the PCA plot which shows how the variables correlate with one another. We can see from this that all the playlist variables are in similar directions and the released_year (which negatively correlates with # of streams) is in the opposite direction. This visualizes many of the relationships in the data and provides insight as to which ones are important for predicting the number of streams. Mentioned earlier, Another important finding is that the release_year is only negatively correlated with the number of streams because more recent songs do not have enough time to gain the maximum number of streams because the data is taken at a specific point in time. Also, from the plot of released_year against streams, we notice that the older songs have less streams than songs in the years after, which could tell us that the 'hype' or 'enjoyment' for the songs start to decrease the longer that they are out. Many of the other variables in this data set are actually shown to have little to no affect on predicting the number of streams a song has. This is because the taste in music of people is widely varied, so there is not one type of music that is extremely dominant. For models such as K-nearest neighbors, we decided to leave out many of these variables 1. because KNN works better with less predictors and 2. because they were not necessary for the prediction accuracy. On the other hand, for the tree based methods, we did leave all of the predictors in because when we tested them, the model worked better with more predictors. The Bagged model was the best performing model with an Test MSE of .2847. This means that this model did the best at predicting the number of streams on the test data set. If given a new data set with new songs, the best model to predict the performance of the songs would be the bagging model.
+
+
+
